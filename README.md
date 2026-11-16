@@ -1,4 +1,4 @@
-# HackUMass2026Project
+# TrashBot
 
 
 bruh
