@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+venv/
+
+# Big model files - recreate with the commands in README.md
+models/
+*.pt
+
+# Datasets and training output from the early YOLO/TrashNet experiment
+dataset/
+trashnet_raw/
+dataset-resized.zip
+runs/
+
+# Generated / scratch
+my_photos/embeddings.npz
+*.wav
+.lgd-nfy0
