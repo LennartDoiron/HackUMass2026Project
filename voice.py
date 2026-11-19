@@ -27,6 +27,13 @@ COMMANDS = {
     "recycling":       "recycle",
     "recycle":         "recycle",
     "reset":           "reset",     # re-learn the empty background
+    # teaching: the item on the tray (or the one just sorted) is saved as an
+    # example photo for that bin, so the AI gets it right next time
+    "that's recycling": "learn_recycle",
+    "this is recycling": "learn_recycle",
+    "that's trash":     "learn_trash",
+    "this is trash":    "learn_trash",
+    "wrong":            "wrong",     # the item just sorted went in the wrong bin
 }
 MIC_DEVICE  = "plughw:CARD=sndrpigooglevoi"   # the I2S mic (see: arecord -l)
 MIC_CHANNEL = 0                  # the mic is on the left channel; right is silent

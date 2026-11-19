@@ -3,9 +3,9 @@ from time import sleep, monotonic
 import math
 
 # ---------- settings ----------
-LEVEL = -20        # your flat position
-TILT = 40          # degrees to tilt each way
-TILT_TIME = 1.0   # seconds to tilt down (bigger = slower, smoother)
+LEVEL = 0        # your flat position
+TILT = 70          # degrees to tilt each way
+TILT_TIME = 1.2  # seconds to tilt down (bigger = slower, smoother)
 RETURN_TIME = 1.5  # seconds to come back up
 SLIDE_WAIT = 1.0   # pause so the item slides off
 PWM_CHIP = 0       # if you saw pwmchip2 in step 1, change this to 2

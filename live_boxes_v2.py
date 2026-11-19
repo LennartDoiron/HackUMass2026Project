@@ -1,7 +1,10 @@
 """
 live_boxes_v2.py - the trashbot main program: camera + AI + tray servo + voice.
 
-Run:   cd ~/trashbot && source venv/bin/activate && python live_boxes_v2.py
+Runs by itself at power-on (systemd service "trashbot", see install_service.sh).
+       Status / logs:  systemctl status trashbot      journalctl -u trashbot -f
+Run by hand:   sudo systemctl stop trashbot      (frees the camera, then:)
+       cd ~/trashbot && source venv/bin/activate && python live_boxes_v2.py
 View:  http://trashbot.local:8000         live annotated view
        http://trashbot.local:8000/mask    debug: what the item-finder sees (green = item)
        http://trashbot.local:8000/reset   re-learn the empty background (tray must be empty!)
@@ -9,14 +12,19 @@ View:  http://trashbot.local:8000         live annotated view
 Say:   "Trash bot, empty trash" / "Trash bot, empty recycling" to tilt the tray by voice.
 
 How it works (same order as the code below):
-  1. DETECTOR   finds items by comparing each frame to the empty background.
+  0. CALIBRATE  at startup the EMPTY tray is tilted each way and photographed
+                after each return, so its slightly different resting spots
+                count as "nothing".
+  1. DETECTOR   finds items = what differs from ALL the empty-tray pictures.
                 Shadows are ignored (darker but same colour = shadow).
   2. TRACKER    follows each box between frames and waits until it stops moving.
-  3. CLASSIFIER CLIP turns the crop into numbers and compares them with
+  3. CLASSIFIER first: does the box look like the same spot of the empty tray?
+                Then it's a false alarm, ignored. Otherwise CLIP compares it with
                   a) text descriptions of each item (works with no photos), and
                   b) YOUR photos in my_photos/<item>/ (optional, much more accurate).
   4. VOTING     several frames are averaged before a final answer is shown.
-  5. ACTION     RECYCLE / TRASH answer -> the tray tilts that way (servo.py).
+  5. ACTION     exactly ONE item with a RECYCLE / TRASH answer -> the tray tilts
+                that way (servo.py). Two items or ASK FOR HELP -> no tilt.
                 A voice command (voice.py) tilts it too, e.g. after "ASK FOR HELP".
 
 Other files:
@@ -28,7 +36,7 @@ Other files:
 """
 import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")     # never touch the internet (demo is offline)
-import time, threading, warnings
+import sys, time, socket, signal, threading, traceback, warnings
 from pathlib import Path
 import cv2, numpy as np
 
@@ -74,8 +82,10 @@ ITEMS = {
                                  "a piece of white foam packaging"]),
     "food":           ("trash", ["food scraps", "leftover food", "a banana peel",
                                  "a piece of fruit"]),
-    "greasy":         ("trash", ["a greasy paper plate", "a food-stained paper container",
-                                 "a greasy pizza box"]),
+    # "greasy" is switched off: CLIP can't see grease, and this line pulled plain
+    # cardboard and paper into the trash. Re-enable only with your own photos of it.
+    # "greasy":         ("trash", ["a greasy paper plate", "a food-stained paper container",
+    #                              "a greasy pizza box"]),
     # ---------------- other (ask for help) ----------------
     "charger":        ("other", ["a phone charger", "a USB cable", "a power adapter",
                                  "a tangled cable"]),
@@ -113,6 +123,8 @@ PHOTO_TOP_K     = 3     # average the K most similar photos of each item
 
 # ---- 4. DETECTOR: finding items against the empty background -----------------
 MIN_AREA       = 1500   # ignore blobs smaller than this (pixels)
+MIN_SIDE       = 25     # ignore boxes thinner than this (pixels): slivers along the
+                        #   tray edge when it comes back from a tilt a little shifted
 COLOR_DIFF     = 12     # colour change that counts as "item" (lower = more sensitive)
 DARK_RATIO     = 0.55   # darker than this x background = item. Between this and
                         #   ~1.0 with no colour change = SHADOW, ignored.
@@ -122,13 +134,21 @@ CLOSE_PX       = 13     # glue fragments of one item closer than this (pixels)
 SPLIT_TOUCHING = True   # try to split two touching items into two boxes
 SPLIT_NECK     = 0.60   # split only if the join is narrower than this x item width
 BIG_CHANGE     = 0.60   # more than this fraction of the view changed = lighting/camera moved
+BLUR           = 9      # smooths the tray's glitter texture before comparing (odd number)
+CALIBRATE_TILTS = 1     # at startup, tilt each way this many times and photograph the
+                        #   EMPTY tray after each return, so the tray's slightly different
+                        #   resting positions / glare are known as "nothing". 0 = off.
+MAX_BACKGROUNDS = 8     # how many empty-tray pictures to remember
+EMPTY_SIM      = 0.94   # a box that looks this similar (0..1, to CLIP) to the same spot
+                        #   on the empty tray is a false alarm. Measured on your tray:
+                        #   empty spots 0.97-0.99, spots with an item 0.81-0.90.
 
 # ---- 5. TRACKER: stillness -----------------------------------------------------
 SETTLE_SECONDS = 0.35   # item must be still this long before the AI looks at it
 MOTION_LIMIT   = 2.5    # average pixel change inside the box that counts as "moving"
 LOST_SECONDS   = 0.5    # forget a box after it has been gone this long
 EMPTY_REFRESH_SECONDS = 1.5  # tray empty this long -> slowly re-learn background (drift)
-ABSORB_SECONDS = 3.0    # a box the AI calls "empty" for this long is merged into background
+ABSORB_SECONDS = 1.0    # a box the AI calls "empty" for this long is merged into background
 
 # ---- 6. MODEL / CAMERA / WEB ---------------------------------------------------
 CLIP_NAME  = "openai/clip-vit-base-patch32"
@@ -136,12 +156,18 @@ ONNX_FILE  = HERE / "models" / "clip_vision.onnx"   # made by export_onnx.py (2x
 AI_THREADS = 3          # of 4 cores; leaves one for the live view
 FRAME_SIZE = (640, 480)
 PORT       = 8000
-WAIT_FOR_ENTER = True   # False = grab the background immediately at startup
+WAIT_FOR_ENTER = True   # run by hand: wait for Enter before learning the empty tray.
+                        #   (Ignored when started at boot - there is no keyboard then.)
+BOOT_DELAY = 5          # started at boot: seconds to wait before learning the empty tray
+HANG_SECONDS = 20       # a loop that hasn't moved for this long = frozen -> restart
+CRASH_LOG = HERE / "logs" / "crash.log"   # every crash/restart reason is appended here
 
 # ---- 7. SERVO + VOICE (their own settings are at the top of servo.py / voice.py) ----
 SERVO_ENABLED = True    # False = never move the tray (vision only)
 VOICE_ENABLED = True    # False = no microphone
 AFTER_SORT_SECONDS = 1.0  # after the tray is flat again, wait this long before looking
+MAX_SAME_SPOT = 2       # the AI tilted for the same spot this many times in a row ->
+                        #   it's not an item (tray shifted / glare): learn it as empty tray
 
 # =============================================================================
 #  END OF SETTINGS
@@ -299,6 +325,19 @@ class Classifier:
         w = PHOTO_WEIGHT * trust
         return (1 - w) * p_text + w * p_photo
 
+    def add_photo(self, crop_bgr, item_index):
+        """Learn one new example right now (used by voice teaching) and save it
+        to my_photos/<item>/ so it is remembered next time too."""
+        name = NAMES[item_index]
+        (PHOTO_DIR / name).mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(PHOTO_DIR / name / f"voice_{int(time.time() * 1000)}.jpg"), crop_bgr)
+        feat = self.embed([crop_bgr])
+        if self.photo_feats is None:
+            self.photo_feats, self.photo_item = feat, np.array([item_index])
+        else:
+            self.photo_feats = np.vstack([self.photo_feats, feat])
+            self.photo_item = np.append(self.photo_item, item_index)
+
     def classify(self, crop_bgr, turns=0):
         """One look at one square crop. turns = rotate by turns x 90 degrees
         (the camera looks straight down, so any rotation is a valid view)."""
@@ -338,18 +377,52 @@ def _ellipse(px):
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (px, px))
 
 
-class Detector:
-    def set_background(self, frames):
-        """frames = a few pictures of the EMPTY tray (averaged to remove noise)."""
-        mean = np.mean(np.stack(frames).astype(np.float32), axis=0).astype(np.uint8)
-        self.L, self.A, self.B, edge = self._features(mean)
+class Background:
+    """One picture of the EMPTY tray, plus the numbers the detector compares with."""
+    def __init__(self, frames):
+        # average a few frames to remove camera noise
+        self.frame = np.mean(np.stack(frames).astype(np.float32), axis=0).astype(np.uint8)
+        self.L, self.A, self.B, edge = Detector._features(self.frame)
         # background edges, fattened a little so tiny camera wobble is forgiven
         self.edge = cv2.dilate(edge, _ellipse(5))
+
+
+class Detector:
+    """Finds items = pixels that differ from EVERY remembered empty-tray picture.
+    Several pictures (taken after tilting each way) cover the tray's slightly
+    different resting positions, so a tiny shift of the tray is not an "item"."""
+
+    def set_background(self, frames):
+        """Start over with one empty-tray picture (made from a few frames)."""
+        self.backgrounds = [Background(frames)]
+
+    def add_background(self, frames, keep_box=None):
+        """Remember one more empty-tray picture (e.g. after the tray tilted and
+        came back). keep_box = an area NOT to learn (the item just sorted might
+        still be lying there) - it is copied from the live picture instead."""
+        bg = Background(frames)
+        if keep_box is not None:
+            x, y, w, h = keep_box
+            m = 20                                   # plus a margin for its shadow
+            area = np.s_[max(0, y - m):y + h + m, max(0, x - m):x + w + m]
+            live = self.backgrounds[0]
+            for name in ("frame", "L", "A", "B", "edge"):
+                getattr(bg, name)[area] = getattr(live, name)[area]
+        self.backgrounds.append(bg)
+        if len(self.backgrounds) > MAX_BACKGROUNDS:
+            del self.backgrounds[1]                  # keep [0] (the live one), drop oldest extra
+
+    def background_crop(self, frame, box):
+        """The same square of the empty tray that most resembles this spot now."""
+        x, y, w, h = box
+        def diff(bg):
+            return cv2.absdiff(bg.frame[y:y + h, x:x + w], frame[y:y + h, x:x + w]).mean()
+        return square_crop(min(self.backgrounds, key=diff).frame, box)
 
     @staticmethod
     def _features(frame):
         """Brightness (L), colour (A, B) and edge strength of a frame."""
-        lab = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2LAB)
+        lab = cv2.cvtColor(cv2.GaussianBlur(frame, (BLUR, BLUR), 0), cv2.COLOR_BGR2LAB)
         L, A, B = [c.astype(np.float32) for c in cv2.split(lab)]
         L += 1.0                                             # avoid divide-by-zero
         edge = cv2.magnitude(cv2.Sobel(L, cv2.CV_32F, 1, 0), cv2.Sobel(L, cv2.CV_32F, 0, 1))
@@ -358,15 +431,19 @@ class Detector:
     def find(self, frame):
         """Returns (boxes, mask, big_change). boxes = [(x, y, w, h), ...]."""
         L, A, B, edge = self._features(frame)
-        ratio = L / self.L                                   # 1.0 = same brightness
-        # Lighting drift: if the WHOLE picture got 5% brighter, undo that first.
-        gain = float(np.clip(np.median(ratio[::8, ::8]), 0.6, 1.6))
-        ratio /= gain
-        colour = cv2.magnitude(A - self.A, B - self.B)
-        item = ((colour > COLOR_DIFF) |                      # different colour
-                (ratio < DARK_RATIO) |                       # too dark to be a shadow
-                (ratio > BRIGHT_RATIO) |                     # brighter (glare, white item)
-                (edge - self.edge * gain > EDGE_DIFF))       # new sharp edge (clear plastic)
+        item = None
+        for bg in self.backgrounds:
+            ratio = L / bg.L                                 # 1.0 = same brightness
+            # Lighting drift: if the WHOLE picture got 5% brighter, undo that first.
+            gain = float(np.clip(np.median(ratio[::8, ::8]), 0.6, 1.6))
+            ratio /= gain
+            colour = cv2.magnitude(A - bg.A, B - bg.B)
+            differs = ((colour > COLOR_DIFF) |               # different colour
+                       (ratio < DARK_RATIO) |                # too dark to be a shadow
+                       (ratio > BRIGHT_RATIO) |              # brighter (glare, white item)
+                       (edge - bg.edge * gain > EDGE_DIFF))  # new sharp edge (clear plastic)
+            # an item must differ from ALL empty-tray pictures
+            item = differs if item is None else (item & differs)
         mask = item.astype(np.uint8) * 255
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _ellipse(3))          # remove specks
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _ellipse(CLOSE_PX))  # join fragments
@@ -384,17 +461,25 @@ class Detector:
             if cv2.contourArea(c) < MIN_AREA:
                 continue
             box = cv2.boundingRect(c)
-            boxes += split_touching(mask, box) if SPLIT_TOUCHING else [box]
+            parts = split_touching(mask, box) if SPLIT_TOUCHING else [box]
+            boxes += [b for b in parts if min(b[2], b[3]) >= MIN_SIDE]
         return boxes, mask, big_change
 
     def refresh(self, frame, rate=0.1, box=None):
-        """Blend the current frame into the background (whole frame, or one box).
-        Used when the tray is empty, so slow lighting changes never build up."""
+        """Blend the current frame into the live background (whole frame, or one
+        box). Used when the tray is empty, so slow lighting changes never build up,
+        and to wipe out a false alarm."""
         L, A, B, edge = self._features(frame)
         edge = cv2.dilate(edge, _ellipse(5))
         s = np.s_[:, :] if box is None else np.s_[box[1]:box[1] + box[3], box[0]:box[0] + box[2]]
-        for bg, new in ((self.L, L), (self.A, A), (self.B, B), (self.edge, edge)):
-            bg[s] = (1 - rate) * bg[s] + rate * new[s]
+        for bg in self.backgrounds:
+            if box is None and bg is not self.backgrounds[0]:
+                continue                             # slow drift: only the live picture
+            for old, new in ((bg.L, L), (bg.A, A), (bg.B, B), (bg.edge, edge)):
+                old[s] = (1 - rate) * old[s] + rate * new[s]
+            f = bg.frame.astype(np.float32)
+            f[s] = (1 - rate) * f[s] + rate * frame[s]
+            bg.frame = f.astype(np.uint8)
 
 
 def split_touching(mask, box):
@@ -456,6 +541,7 @@ class Track:
         self.votes = []             # one probability list per frame looked at
         self.final = None           # (kind, item, conf) once the vote is done
         self.final_time = None
+        self.acted = False          # True once the tray has been tilted for this item
         self.version = getattr(self, "version", 0) + 1   # lets the AI thread spot a reset
 
     def label(self):
@@ -490,10 +576,76 @@ def update_tracks(tracks, boxes, motion_of, now):
 # -----------------------------------------------------------------------------
 #  MAIN PROGRAM - camera, the two loops, and the web stream
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+#  CRASH PROTECTION
+#  The service (trashbot.service) restarts the program whenever it exits. So the
+#  rule here is simple: if anything goes wrong, log why and EXIT - a fresh start
+#  is the most reliable repair. Also, systemd kills and restarts us if we stop
+#  sending "I'm alive" (WatchdogSec), which catches a complete freeze.
+# -----------------------------------------------------------------------------
+heartbeat = {}                # loop name -> last time it went round
+
+
+def log_crash(reason):
+    print(reason, flush=True)
+    try:
+        CRASH_LOG.parent.mkdir(exist_ok=True)
+        with open(CRASH_LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {reason}\n")
+    except OSError:
+        pass
+
+
+def die(reason):
+    """Log and quit at once (the service starts us again in a few seconds)."""
+    log_crash(reason)
+    os._exit(1)
+
+
+def systemd_notify(message):
+    """Tell systemd how we're doing (only when started as a service)."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(message.encode(), addr)
+    except OSError:
+        pass
+
+
+def start_thread(fn, name):
+    """Run fn in the background; if it ever crashes, log it and restart everything."""
+    def guarded():
+        try:
+            fn()
+        except Exception:
+            die(f"CRASH in {name}:\n{traceback.format_exc()}")
+        die(f"{name} stopped unexpectedly")
+    heartbeat[name] = time.time()
+    threading.Thread(target=guarded, name=name, daemon=True).start()
+
+
+def watchdog():
+    """Every 5 s: if a loop is frozen, restart; otherwise tell systemd we're alive."""
+    while True:
+        time.sleep(5)
+        for name, last in list(heartbeat.items()):
+            if time.time() - last > HANG_SECONDS:
+                die(f"FROZEN: {name} has not moved for {HANG_SECONDS} s - restarting")
+        systemd_notify("WATCHDOG=1")
+
+
 def open_camera():
     """Start the Pi camera and lock exposure + white balance (same as v1)."""
     from picamera2 import Picamera2
-    cam = Picamera2()
+    try:
+        cam = Picamera2()
+    except Exception as e:
+        raise SystemExit(f"Camera not available ({e}). If the trashbot service is "
+                         "running it owns the camera: sudo systemctl stop trashbot")
     cam.configure(cam.create_preview_configuration(
         main={"size": FRAME_SIZE, "format": "RGB888"}))      # "RGB888" arrives as BGR
     cam.start()
@@ -507,31 +659,121 @@ def open_camera():
     return cam
 
 
+def power_problem():
+    """Pi 5 power check. Returns a warning string, or "" if power looks fine.
+    Low voltage makes the Pi switch itself off (red light) - usually because the
+    servo pulls power from the Pi's 5V pin, or the charger can't give 5 A."""
+    import subprocess
+    try:
+        bits = int(subprocess.run(["vcgencmd", "get_throttled"], capture_output=True,
+                                  text=True).stdout.split("=")[1], 16)
+        if bits & 0x1:
+            return "LOW VOLTAGE NOW"
+        if bits & 0x10000:
+            return "voltage dipped since boot"
+    except Exception:
+        pass
+    return ""
+
+
 def main():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    try:   # how much current the power supply promised the Pi (5000 = official 27 W)
+        ma = int.from_bytes(open("/proc/device-tree/chosen/power/max_current", "rb").read(), "big")
+        if ma < 5000:
+            print(f"WARNING: power supply only offers {ma / 1000:.0f} A (Pi 5 wants 5 A). "
+                  "Power the servo separately or the Pi may switch off.")
+    except OSError:
+        pass
+
+    # Ctrl+C / "systemctl stop": exit cleanly so the servo is released
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *args: sys.exit(0))
+    # keep systemd happy during the slow startup (model loading, calibration);
+    # watchdog() takes over once the main loops run
+    starting = threading.Event()
+    starting.set()
+
+    def startup_ping():
+        while starting.is_set():
+            systemd_notify("WATCHDOG=1")
+            time.sleep(5)
+    threading.Thread(target=startup_ping, daemon=True).start()
 
     clf = Classifier()
     clf.classify(np.zeros((224, 224, 3), np.uint8))          # warm-up run
     cam = open_camera()
     det = Detector()
-    if WAIT_FOR_ENTER:
+
+    # Servo FIRST: it snaps the tray to flat. The empty-tray picture below must be
+    # taken AFTER that, or the tray's own movement looks like a new item to the
+    # camera and the AI might sort it (= "it tilts when I start the program").
+    tray = None
+    if SERVO_ENABLED:
+        import servo
+        tray = servo.Tray()
+        time.sleep(1.0)                                      # let the tray settle flat
+
+    if WAIT_FOR_ENTER and sys.stdin.isatty():
         input("Clear the area under the camera, then press Enter...")
+    else:                                                    # started at boot
+        print(f"Learning the empty tray in {BOOT_DELAY} s - keep it clear.")
+        time.sleep(BOOT_DELAY)
     det.set_background([cam.capture_array() for _ in range(10)])
-    print(f"Background saved. Open http://trashbot.local:{PORT} on your Mac.")
+    # Calibration: tilt the EMPTY tray each way and photograph it after it comes
+    # back. It never comes back to exactly the same spot, and the detector must
+    # know all those spots are "nothing".
+    if tray and CALIBRATE_TILTS:
+        print("Calibrating: tilting the EMPTY tray to learn what 'nothing' looks like...")
+        for _ in range(CALIBRATE_TILTS):
+            for side in ("trash", "recycle"):
+                tray.sort(side)
+                while tray.busy:
+                    time.sleep(0.05)
+                time.sleep(AFTER_SORT_SECONDS)
+                det.add_background([cam.capture_array() for _ in range(5)])
+    print(f"Learned {len(det.backgrounds)} empty-tray pictures. "
+          f"Open http://trashbot.local:{PORT} on your Mac.")
 
     lock = threading.Lock()
     state = {"frame": None, "jpg": None, "mask_jpg": None, "reset": False}
     tracks = []
 
     # ---------- actions: tilt the tray (from the AI or from a voice command) ----------
-    tray = None
-    if SERVO_ENABLED:
-        import servo
-        tray = servo.Tray()
+    teach_queue = []          # (crop, bin, probs) waiting to be learned by the AI thread
+    last_sorted = {}          # the item the tray tilted for most recently
+
+    def teach(action):
+        """Voice teaching. "learn_recycle"/"learn_trash": the item on the tray is
+        that bin (learn it AND tilt). "wrong": the item just sorted was the
+        other bin (learn it; it's already gone)."""
+        with lock:
+            real = [t for t in tracks if not (t.final and t.final[0] == "NOTHING")]
+            on_tray = real[0] if len(real) == 1 and real[0].votes else None
+            if on_tray and action != "wrong":
+                bin_ = "recyclable" if action == "learn_recycle" else "trash"
+                teach_queue.append((square_crop(state["frame"], on_tray.box).copy(), bin_,
+                                    np.mean(on_tray.votes, axis=0),
+                                    det.background_crop(state["frame"], on_tray.box)))
+                on_tray.acted = True                 # the AI must not tilt it as well
+                do_action("recycle" if bin_ == "recyclable" else "trash", "VOICE")
+                return
+            if last_sorted and time.time() - last_sorted["time"] < 30:
+                if action == "wrong":
+                    bin_ = "trash" if last_sorted["bin"] == "recyclable" else "recyclable"
+                else:
+                    bin_ = "recyclable" if action == "learn_recycle" else "trash"
+                teach_queue.append((last_sorted["crop"], bin_, last_sorted["probs"],
+                                    last_sorted["bg"]))
+                return
+        print("VOICE: nothing to learn (put ONE item on the tray first)")
 
     def do_action(action, why):
-        """action = "trash" / "recycle" (tilt that way) or "reset" (re-learn background)."""
-        if action == "reset":
+        """action = "trash" / "recycle" (tilt that way), "reset" (re-learn
+        background), or a teaching command (see teach())."""
+        if action in ("learn_recycle", "learn_trash", "wrong"):
+            teach(action)
+        elif action == "reset":
             state["reset"] = True
             print(f"{why}: re-learning the background")
         elif tray is None:
@@ -541,11 +783,38 @@ def main():
         else:
             print(f"{why}: ignored, the tray is already moving")
 
-    def on_final_answer(kind, item, confidence):
-        """Called ONCE per item when the vote is finished and exactly one item is
-        in view. kind is "RECYCLE", "TRASH" or "HELP" (HELP = don't move; wait
-        for a person or a voice command)."""
-        print(f"FINAL: {kind:8s} {item}  ({confidence:.0%})")
+    def maybe_sort():
+        """Tilt the tray when exactly ONE real item is on it and its answer is
+        RECYCLE or TRASH. False alarms (answer "nothing") don't count as items.
+        HELP = don't move; wait for a person or a voice command."""
+        with lock:
+            real = [t for t in tracks if not (t.final and t.final[0] == "NOTHING")]
+            if len(real) != 1 or not real[0].final or real[0].acted:
+                return
+            t = real[0]
+            t.acted = True                           # act once per item
+            kind = t.final[0]
+            if kind in ("RECYCLE", "TRASH"):
+                # Tilted for this same spot just now, and it's back? Then it's not an
+                # item (the tray shifted, glare...) - stop the loop, learn it as tray.
+                # (streak goes back to 0 as soon as the tray is seen empty)
+                again = (last_sorted and last_sorted["streak"] > 0
+                         and time.time() - last_sorted["time"] < 20
+                         and overlap(last_sorted["box"], t.box) > 0.4)
+                streak = last_sorted["streak"] + 1 if again else 1
+                if streak > MAX_SAME_SPOT:
+                    print(f"SKIPPED: tilted for this spot {MAX_SAME_SPOT}x already - "
+                          "learning it as empty tray (push it off if it's a real item)")
+                    det.refresh(state["frame"], rate=1.0, box=t.box)
+                    t.final, t.final_time = ("NOTHING", "stuck spot", 0.0), time.time()
+                    last_sorted.clear()
+                    return
+                # remember it, for "trash bot, wrong" and the checks above
+                last_sorted.update(crop=square_crop(state["frame"], t.box).copy(),
+                                   bg=det.background_crop(state["frame"], t.box),
+                                   probs=np.mean(t.votes, axis=0), time=time.time(),
+                                   bin="recyclable" if kind == "RECYCLE" else "trash",
+                                   box=t.box, streak=streak)
         if kind in ("RECYCLE", "TRASH"):
             do_action("recycle" if kind == "RECYCLE" else "trash", "AI")
 
@@ -556,10 +825,12 @@ def main():
 
     # ---------- fast loop: camera + detector + tracker + drawing (no AI) ----------
     def video_loop():
+        """Camera + detector + drawing. heartbeat["video"] proves it's alive."""
         history = []                 # small grey frames from the last few frames
         empty_since, n, fps, t_fps = time.time(), 0, 0.0, time.time()
-        look_again_at, sorting = 0.0, ""
+        look_again_at, sorting, power, relearn = 0.0, "", "", False
         while True:
+            heartbeat["video"] = time.time()
             frame = cam.capture_array()
             now = time.time()
             n += 1
@@ -568,6 +839,17 @@ def main():
             # so don't look for items: forget the old boxes and just show the camera.
             if tray and tray.busy:
                 look_again_at, sorting = now + AFTER_SORT_SECONDS, tray.side
+                relearn = True
+            if now >= look_again_at and relearn:
+                # Tray is flat again and settled. It never lands in exactly the same
+                # spot, so photograph the (now empty) tray again - except where the
+                # sorted item was, in case it didn't slide off.
+                relearn = False
+                with lock:
+                    keep = (last_sorted.get("box") if last_sorted
+                            and now - last_sorted["time"] < 15 else None)
+                det.add_background([frame] + [cam.capture_array() for _ in range(4)], keep)
+                continue
             if now < look_again_at:
                 with lock:
                     tracks.clear()
@@ -576,8 +858,9 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 state["jpg"] = cv2.imencode(".jpg", frame)[1].tobytes()
                 continue
-            if state["reset"]:                               # /reset was opened
-                det.set_background([frame] + [cam.capture_array() for _ in range(9)])
+            if state["reset"]:                               # /reset or voice "reset"
+                # replace the live empty-tray picture; keep the calibration ones
+                det.backgrounds[0] = Background([frame] + [cam.capture_array() for _ in range(9)])
                 with lock:
                     tracks.clear()
                 state["reset"] = False
@@ -604,14 +887,19 @@ def main():
                     if (t.final and t.final[0] == "NOTHING"
                             and now - t.final_time > ABSORB_SECONDS):
                         det.refresh(frame, rate=1.0, box=t.box)
-                view = [(t.box, *t.label()) for t in tracks]
-                n_items = sum(not (t.final and t.final[0] == "NOTHING") for t in tracks)
+                # false alarms are not drawn (see them on /mask if you're curious)
+                real = [t for t in tracks if not (t.final and t.final[0] == "NOTHING")]
+                view = [(t.box, *t.label()) for t in real]
+                n_items = len(real)
 
             # tray empty for a while -> slowly follow lighting drift
             if boxes:
                 empty_since = now
-            elif now - empty_since > EMPTY_REFRESH_SECONDS and n % 5 == 0:
-                det.refresh(frame)
+            else:
+                if now - empty_since > 1.0 and last_sorted.get("streak"):
+                    last_sorted["streak"] = 0            # tray seen empty: the last item left
+                if now - empty_since > EMPTY_REFRESH_SECONDS and n % 5 == 0:
+                    det.refresh(frame)
 
             # ----- draw -----
             out = frame.copy()
@@ -627,6 +915,13 @@ def main():
                         0.8, (255, 255, 255), 2)
             if n % 20 == 0:
                 fps, t_fps = 20 / (now - t_fps), now
+            if n % 40 == 0:
+                power = power_problem()
+                if power:
+                    print("POWER WARNING:", power)
+            if power:
+                cv2.putText(out, "POWER: " + power, (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             cv2.putText(out, f"{fps:.0f} fps", (FRAME_SIZE[0] - 90, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             state["jpg"] = cv2.imencode(".jpg", out)[1].tobytes()
@@ -641,6 +936,22 @@ def main():
     # ---------- slow loop: AI looks at still items and collects votes ----------
     def ai_loop():
         while True:
+            heartbeat["ai"] = time.time()
+            maybe_sort()
+            while teach_queue:                       # voice teaching (runs here: one AI thread)
+                crop, bin_, probs, bg_crop = teach_queue.pop(0)
+                # never learn a picture of the EMPTY tray as an item - that one bad
+                # photo makes every false box look like that item (sorting loop)
+                a, b = clf.embed([crop, bg_crop])
+                if float(a @ b) > EMPTY_SIM:
+                    print("NOT LEARNED: that looks like the empty tray, not an item.")
+                    continue
+                # file it under the most likely item IN that bin (e.g. "cardboard")
+                idx = max((i for i in range(len(NAMES)) if BIN_OF[i] == bin_),
+                          key=lambda i: probs[i])
+                clf.add_photo(crop, idx)
+                print(f"LEARNED: that was {NAMES[idx]} ({bin_}). "
+                      f"{int((clf.photo_item == idx).sum())} example photos of it now.")
             now = time.time()
             with lock:
                 ready = [t for t in tracks if not t.final
@@ -650,11 +961,26 @@ def main():
                     job = None
                 else:
                     t = min(ready, key=lambda t: len(t.votes))   # fewest votes first
-                    job = (t, t.version, len(t.votes), square_crop(state["frame"], t.box).copy())
+                    frame = state["frame"]
+                    # first look at a new box: also fetch the same spot of the empty tray
+                    bg_crop = None if t.votes else det.background_crop(frame, t.box)
+                    job = (t, t.version, len(t.votes), square_crop(frame, t.box).copy(), bg_crop)
             if job is None:
                 time.sleep(0.03)
                 continue
-            t, version, turns, crop = job
+            t, version, turns, crop, bg_crop = job
+
+            if bg_crop is not None:
+                # Is this box just the empty tray (glare, tray moved a bit)? Compare
+                # it with the same spot of the empty tray, as CLIP sees them.
+                now_feat, empty_feat = clf.embed([crop, bg_crop])
+                sim = float(now_feat @ empty_feat)
+                if sim > EMPTY_SIM:
+                    with lock:
+                        if t.version == version:
+                            t.final, t.final_time = ("NOTHING", "empty tray", sim), time.time()
+                    continue
+
             probs = clf.classify(crop, turns)                # ~0.12 s, outside the lock
             with lock:
                 if t.version != version:                     # it moved meanwhile: discard
@@ -664,12 +990,8 @@ def main():
                 enough = len(t.votes) >= MIN_VOTES and conf >= EARLY_CONF and kind != "HELP"
                 if enough or len(t.votes) >= MAX_VOTES:
                     t.final, t.final_time = (kind, item, conf), time.time()
-                    # "alone" = the only real item (false alarms don't count)
-                    alone = sum(not (x.final and x.final[0] == "NOTHING") for x in tracks) == 1
-                else:
-                    continue
-            if alone and kind != "NOTHING":
-                on_final_answer(kind, item, conf)
+                    if kind != "NOTHING":
+                        print(f"FINAL: {kind:8s} {item}  ({conf:.0%})")
 
     # ---------- web stream ----------
     class Stream(BaseHTTPRequestHandler):
@@ -698,10 +1020,21 @@ def main():
         def log_message(self, *args):
             pass
 
-    threading.Thread(target=video_loop, daemon=True).start()
-    threading.Thread(target=ai_loop, daemon=True).start()
+    start_thread(video_loop, "video")
+    start_thread(ai_loop, "ai")
+    starting.clear()
+    threading.Thread(target=watchdog, daemon=True).start()
+    systemd_notify("READY=1")
+    log_crash("started")
     ThreadingHTTPServer(("0.0.0.0", PORT), Stream).serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit) as e:
+        if isinstance(e, SystemExit) and e.code not in (None, 0):
+            die(str(e))                                      # e.g. camera missing
+        print("Stopped.")
+    except Exception:
+        die(f"CRASH during startup:\n{traceback.format_exc()}")

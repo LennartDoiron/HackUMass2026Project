@@ -5,6 +5,8 @@ Same hardware and motion as servo_test.py (hardware PWM on GPIO12, smooth S-curv
 
 Test on its own:   python servo.py            (tilts trash side, then recycling side)
                    python servo.py trash      (just one side)
+Find true flat:    python servo.py level -20  (holds that angle; try -18, -22... until the
+                   tray is perfectly flat, then put that number in LEVEL below)
 
 Used by live_boxes_v2.py like this:
     tray = Tray()
@@ -14,8 +16,8 @@ Used by live_boxes_v2.py like this:
 import atexit, threading, time
 
 # ---------- settings ----------
-LEVEL        = -20    # flat position (degrees)
-TILT         = 40     # degrees to tilt each way
+LEVEL        = 10     # flat position (degrees) - found with: python servo.py level 10
+TILT         = 70     # degrees to tilt each way
 TRASH_SIDE   = -1     # -1 or +1. If trash goes into the recycling bin, swap these two.
 RECYCLE_SIDE = +1
 TILT_TIME    = 1.0    # seconds to tilt down (bigger = slower, smoother)
@@ -83,6 +85,12 @@ class Tray:
 
 if __name__ == "__main__":
     import sys
+    if sys.argv[1:2] == ["level"]:                  # calibration: hold one angle
+        LEVEL = float(sys.argv[2]) if len(sys.argv) > 2 else LEVEL
+        Tray()
+        print(f"Holding {LEVEL} degrees. Is the tray flat? Ctrl+C to stop.")
+        while True:
+            time.sleep(1)
     tray = Tray()
     time.sleep(0.5)
     for side in sys.argv[1:] or ["trash", "recycle"]:

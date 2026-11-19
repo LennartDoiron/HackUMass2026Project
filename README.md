@@ -4,12 +4,28 @@ AI recycling bin (HackUMass). A Pi camera looks down at a tray, decides
 recyclable / trash / "ask for help", and a servo tilts the tray to the right side.
 Voice commands can tilt it too. Everything runs offline on a Raspberry Pi 5.
 
-## Run
+## Start at power-on (do once)
+
+    ./install_service.sh        # asks for your password
+
+After that the Pi runs trashbot by itself at every power-on (keep the tray empty
+while it starts - it calibrates, ~40 s after boot). If it crashes or freezes it
+restarts itself within seconds; if the whole Pi freezes it reboots.
+
+    journalctl -u trashbot -f            # live log
+    cat logs/crash.log                   # every start, crash and freeze, with time
+    sudo systemctl stop trashbot         # stop (needed before running it by hand)
+    sudo systemctl disable trashbot      # no auto-start any more
+
+## Run by hand
 
     cd ~/trashbot && source venv/bin/activate
     python live_boxes_v2.py          # then open http://trashbot.local:8000
 
 Say **"Trash bot, empty trash"** or **"Trash bot, empty recycling"** to tilt by voice.
+Teach it: **"Trash bot, that's recycling"** / **"Trash bot, that's trash"** (item on the tray:
+saves it as an example photo and tilts), or **"Trash bot, wrong"** right after a wrong sort.
+Taught photos go to `my_photos/<item>/`; delete a file there to undo a bad lesson.
 
 ## Files
 

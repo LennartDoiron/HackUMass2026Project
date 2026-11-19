@@ -16,3 +16,6 @@ runs/
 my_photos/embeddings.npz
 *.wav
 .lgd-nfy0
+
+# runtime logs
+logs/

@@ -1,0 +1,27 @@
+# systemd service: starts trashbot at power-on and restarts it if it ever stops.
+# Install with:  ./install_service.sh
+[Unit]
+Description=Trashbot - camera, AI sorting, tray servo, voice
+After=sound.target
+# never give up restarting
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+User=admin
+WorkingDirectory=/home/admin/trashbot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/admin/trashbot/venv/bin/python /home/admin/trashbot/live_boxes_v2.py
+# crashed or exited -> start again after 5 s
+Restart=always
+RestartSec=5
+# model loading + tray calibration can take a while at boot
+TimeoutStartSec=300
+# no "I'm alive" for 60 s = frozen -> kill and restart
+WatchdogSec=60
+TimeoutStopSec=15
+# low "kill me first" priority if memory ever runs out
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
