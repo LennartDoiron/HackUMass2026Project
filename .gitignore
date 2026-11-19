@@ -19,3 +19,13 @@ my_photos/embeddings.npz
 
 # runtime logs
 logs/
+
+# macOS
+.DS_Store
+
+# Python / editors / secrets
+.venv/
+*.pyc
+.env
+.vscode/
+.idea/
